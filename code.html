@@ -1,0 +1,1100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI-Powered Systematic Review Screening</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+        // ==================== Data Models ====================
+        const ScreeningDecision = {
+            INCLUDE: 'include',
+            EXCLUDE: 'exclude',
+            MAYBE: 'maybe',
+            PENDING: 'pending',
+            IN_PROGRESS: 'in_progress'
+        };
+
+        // ==================== Main Application ====================
+        function SystematicReviewApp() {
+            const [currentView, setCurrentView] = useState('import');
+            const [references, setReferences] = useState([]);
+            const [criteria, setCriteria] = useState({
+                population: '',
+                intervention: '',
+                comparator: '',
+                outcome: '',
+                studyDesigns: [],
+                additionalCriteria: {}
+            });
+            const [screeningQueue, setScreeningQueue] = useState([]);
+            const [screeningResults, setScreeningResults] = useState([]);
+            const [currentPaper, setCurrentPaper] = useState(null);
+            const [statistics, setStatistics] = useState({
+                total: 0,
+                screened: 0,
+                included: 0,
+                excluded: 0,
+                conflicts: 0,
+                pending: 0
+            });
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [batchMode, setBatchMode] = useState(false);
+            const [filters, setFilters] = useState({
+                year: { min: null, max: null },
+                source: 'all',
+                status: 'all'
+            });
+
+            // ==================== Import Component ====================
+            const ImportReferences = () => {
+                const [dragActive, setDragActive] = useState(false);
+                const fileInputRef = useRef(null);
+                const [importFormat, setImportFormat] = useState('auto');
+                const [previewData, setPreviewData] = useState(null);
+
+                const handleDrag = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (e.type === "dragenter" || e.type === "dragover") {
+                        setDragActive(true);
+                    } else if (e.type === "dragleave") {
+                        setDragActive(false);
+                    }
+                };
+
+                const handleDrop = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setDragActive(false);
+                    
+                    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                        handleFiles(e.dataTransfer.files);
+                    }
+                };
+
+                const handleFiles = (files) => {
+                    const file = files[0];
+                    const reader = new FileReader();
+                    
+                    reader.onload = (e) => {
+                        const content = e.target.result;
+                        parseReferences(content, file.name);
+                    };
+                    
+                    reader.readAsText(file);
+                };
+
+                const parseReferences = (content, filename) => {
+                    let parsed = [];
+                    
+                    // Detect format and parse accordingly
+                    if (filename.endsWith('.ris') || content.includes('TY  -')) {
+                        parsed = parseRIS(content);
+                    } else if (filename.endsWith('.bib') || content.includes('@article')) {
+                        parsed = parseBibTeX(content);
+                    } else if (filename.endsWith('.xml') || content.includes('<PubmedArticle>')) {
+                        parsed = parsePubMedXML(content);
+                    } else if (filename.endsWith('.csv')) {
+                        Papa.parse(content, {
+                            header: true,
+                            complete: (results) => {
+                                parsed = results.data.map(row => ({
+                                    id: row.PMID || row.ID || `ref_${Date.now()}_${Math.random()}`,
+                                    title: row.Title || row.title || '',
+                                    abstract: row.Abstract || row.abstract || '',
+                                    authors: row.Authors || row.authors || '',
+                                    year: row.Year || row.year || '',
+                                    journal: row.Journal || row.journal || '',
+                                    doi: row.DOI || row.doi || '',
+                                    pmid: row.PMID || '',
+                                    status: ScreeningDecision.PENDING
+                                }));
+                                setPreviewData(parsed);
+                            }
+                        });
+                        return;
+                    }
+                    
+                    setPreviewData(parsed);
+                };
+
+                const parseRIS = (content) => {
+                    const references = [];
+                    const entries = content.split(/TY  - /);
+                    
+                    entries.forEach((entry) => {
+                        if (!entry.trim()) return;
+                        
+                        const ref = {
+                            id: `ref_${Date.now()}_${Math.random()}`,
+                            status: ScreeningDecision.PENDING
+                        };
+                        
+                        const lines = entry.split('\n');
+                        lines.forEach((line) => {
+                            const match = line.match(/^([A-Z]{2})\s+-\s+(.*)$/);
+                            if (match) {
+                                const [, tag, value] = match;
+                                switch(tag) {
+                                    case 'TI': ref.title = value; break;
+                                    case 'AB': ref.abstract = value; break;
+                                    case 'AU': 
+                                        ref.authors = ref.authors ? ref.authors + '; ' + value : value;
+                                        break;
+                                    case 'PY': ref.year = value; break;
+                                    case 'JO': ref.journal = value; break;
+                                    case 'DO': ref.doi = value; break;
+                                }
+                            }
+                        });
+                        
+                        if (ref.title) references.push(ref);
+                    });
+                    
+                    return references;
+                };
+
+                const parseBibTeX = (content) => {
+                    const references = [];
+                    const entries = content.match(/@\w+\{[^@]+\}/g) || [];
+                    
+                    entries.forEach((entry) => {
+                        const ref = {
+                            id: `ref_${Date.now()}_${Math.random()}`,
+                            status: ScreeningDecision.PENDING
+                        };
+                        
+                        // Extract fields
+                        const title = entry.match(/title\s*=\s*[{"']([^}"']+)/i);
+                        const abstract = entry.match(/abstract\s*=\s*[{"']([^}"']+)/i);
+                        const author = entry.match(/author\s*=\s*[{"']([^}"']+)/i);
+                        const year = entry.match(/year\s*=\s*[{"'](\d{4})/i);
+                        const journal = entry.match(/journal\s*=\s*[{"']([^}"']+)/i);
+                        const doi = entry.match(/doi\s*=\s*[{"']([^}"']+)/i);
+                        
+                        if (title) ref.title = title[1];
+                        if (abstract) ref.abstract = abstract[1];
+                        if (author) ref.authors = author[1];
+                        if (year) ref.year = year[1];
+                        if (journal) ref.journal = journal[1];
+                        if (doi) ref.doi = doi[1];
+                        
+                        if (ref.title) references.push(ref);
+                    });
+                    
+                    return references;
+                };
+
+                const parsePubMedXML = (content) => {
+                    const references = [];
+                    const parser = new DOMParser();
+                    const xmlDoc = parser.parseFromString(content, "text/xml");
+                    const articles = xmlDoc.getElementsByTagName("PubmedArticle");
+                    
+                    for (let article of articles) {
+                        const ref = {
+                            id: `ref_${Date.now()}_${Math.random()}`,
+                            status: ScreeningDecision.PENDING
+                        };
+                        
+                        // Extract PMID
+                        const pmid = article.querySelector("PMID");
+                        if (pmid) ref.pmid = pmid.textContent;
+                        if (pmid) ref.id = `PMID_${pmid.textContent}`;
+                        
+                        // Extract title
+                        const title = article.querySelector("ArticleTitle");
+                        if (title) ref.title = title.textContent;
+                        
+                        // Extract abstract
+                        const abstract = article.querySelector("AbstractText");
+                        if (abstract) ref.abstract = abstract.textContent;
+                        
+                        // Extract authors
+                        const authors = article.querySelectorAll("Author");
+                        const authorList = [];
+                        authors.forEach(author => {
+                            const lastName = author.querySelector("LastName");
+                            const foreName = author.querySelector("ForeName");
+                            if (lastName && foreName) {
+                                authorList.push(`${lastName.textContent}, ${foreName.textContent}`);
+                            }
+                        });
+                        ref.authors = authorList.join('; ');
+                        
+                        // Extract year
+                        const year = article.querySelector("PubDate Year");
+                        if (year) ref.year = year.textContent;
+                        
+                        // Extract journal
+                        const journal = article.querySelector("Journal Title");
+                        if (journal) ref.journal = journal.textContent;
+                        
+                        if (ref.title) references.push(ref);
+                    }
+                    
+                    return references;
+                };
+
+                const confirmImport = () => {
+                    if (previewData) {
+                        setReferences(previewData);
+                        setScreeningQueue(previewData);
+                        setStatistics(prev => ({
+                            ...prev,
+                            total: previewData.length,
+                            pending: previewData.length
+                        }));
+                        setCurrentView('criteria');
+                    }
+                };
+
+                return (
+                    <div className="max-w-6xl mx-auto p-6">
+                        <div className="bg-white rounded-lg shadow-lg p-8">
+                            <h2 className="text-2xl font-bold mb-6 text-gray-800">
+                                <i className="fas fa-file-import mr-2"></i>
+                                Import References
+                            </h2>
+                            
+                            <div className="mb-6">
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Import Format
+                                </label>
+                                <select 
+                                    value={importFormat}
+                                    onChange={(e) => setImportFormat(e.target.value)}
+                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                >
+                                    <option value="auto">Auto-detect</option>
+                                    <option value="ris">RIS (Mendeley, Zotero)</option>
+                                    <option value="bibtex">BibTeX</option>
+                                    <option value="pubmed">PubMed XML</option>
+                                    <option value="csv">CSV</option>
+                                </select>
+                            </div>
+
+                            <div
+                                className={`border-2 border-dashed rounded-lg p-12 text-center transition-colors
+                                    ${dragActive ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-gray-400'}`}
+                                onDragEnter={handleDrag}
+                                onDragLeave={handleDrag}
+                                onDragOver={handleDrag}
+                                onDrop={handleDrop}
+                            >
+                                <i className="fas fa-cloud-upload-alt text-5xl text-gray-400 mb-4"></i>
+                                <p className="text-lg mb-2">Drag and drop your reference file here</p>
+                                <p className="text-gray-500 mb-4">or</p>
+                                <input
+                                    ref={fileInputRef}
+                                    type="file"
+                                    onChange={(e) => handleFiles(e.target.files)}
+                                    className="hidden"
+                                    accept=".ris,.bib,.xml,.csv,.txt"
+                                />
+                                <button
+                                    onClick={() => fileInputRef.current?.click()}
+                                    className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                                >
+                                    Browse Files
+                                </button>
+                                <p className="text-sm text-gray-500 mt-4">
+                                    Supported formats: RIS, BibTeX, PubMed XML, CSV
+                                </p>
+                            </div>
+
+                            {previewData && (
+                                <div className="mt-8">
+                                    <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
+                                        <p className="text-green-800">
+                                            <i className="fas fa-check-circle mr-2"></i>
+                                            Successfully parsed {previewData.length} references
+                                        </p>
+                                    </div>
+                                    
+                                    <div className="bg-gray-50 rounded-lg p-4 max-h-64 overflow-y-auto">
+                                        <h3 className="font-semibold mb-2">Preview (first 5 references):</h3>
+                                        {previewData.slice(0, 5).map((ref, idx) => (
+                                            <div key={idx} className="mb-2 pb-2 border-b">
+                                                <p className="font-medium">{ref.title}</p>
+                                                <p className="text-sm text-gray-600">
+                                                    {ref.authors} ({ref.year})
+                                                </p>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    
+                                    <button
+                                        onClick={confirmImport}
+                                        className="mt-4 px-8 py-3 bg-green-600 text-white rounded-md hover:bg-green-700 font-medium"
+                                    >
+                                        Proceed to Criteria Setup →
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                );
+            };
+
+            // ==================== Criteria Setup Component ====================
+            const CriteriaSetup = () => {
+                const [studyDesignOptions] = useState([
+                    'RCT', 'Cohort Study', 'Case-Control', 'Cross-Sectional', 
+                    'Systematic Review', 'Meta-Analysis', 'Case Series', 'Case Report'
+                ]);
+                
+                const [additionalCriteriaKey, setAdditionalCriteriaKey] = useState('');
+                const [additionalCriteriaValue, setAdditionalCriteriaValue] = useState('');
+
+                const handleStudyDesignToggle = (design) => {
+                    setCriteria(prev => ({
+                        ...prev,
+                        studyDesigns: prev.studyDesigns.includes(design)
+                            ? prev.studyDesigns.filter(d => d !== design)
+                            : [...prev.studyDesigns, design]
+                    }));
+                };
+
+                const addAdditionalCriteria = () => {
+                    if (additionalCriteriaKey && additionalCriteriaValue) {
+                        setCriteria(prev => ({
+                            ...prev,
+                            additionalCriteria: {
+                                ...prev.additionalCriteria,
+                                [additionalCriteriaKey]: additionalCriteriaValue
+                            }
+                        }));
+                        setAdditionalCriteriaKey('');
+                        setAdditionalCriteriaValue('');
+                    }
+                };
+
+                const removeAdditionalCriteria = (key) => {
+                    setCriteria(prev => {
+                        const newCriteria = { ...prev.additionalCriteria };
+                        delete newCriteria[key];
+                        return {
+                            ...prev,
+                            additionalCriteria: newCriteria
+                        };
+                    });
+                };
+
+                const validateAndProceed = () => {
+                    if (!criteria.population || !criteria.intervention || !criteria.outcome) {
+                        alert('Please fill in at least Population, Intervention, and Outcome');
+                        return;
+                    }
+                    setCurrentView('screening');
+                };
+
+                return (
+                    <div className="max-w-4xl mx-auto p-6">
+                        <div className="bg-white rounded-lg shadow-lg p-8">
+                            <h2 className="text-2xl font-bold mb-6 text-gray-800">
+                                <i className="fas fa-list-check mr-2"></i>
+                                Define Inclusion Criteria (PICO)
+                            </h2>
+
+                            <div className="space-y-6">
+                                {/* Population */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <i className="fas fa-users mr-1"></i>
+                                        Population *
+                                    </label>
+                                    <textarea
+                                        value={criteria.population}
+                                        onChange={(e) => setCriteria(prev => ({ ...prev, population: e.target.value }))}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                        rows="2"
+                                        placeholder="e.g., Adults with type 2 diabetes mellitus"
+                                    />
+                                </div>
+
+                                {/* Intervention */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <i className="fas fa-pills mr-1"></i>
+                                        Intervention *
+                                    </label>
+                                    <textarea
+                                        value={criteria.intervention}
+                                        onChange={(e) => setCriteria(prev => ({ ...prev, intervention: e.target.value }))}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                        rows="2"
+                                        placeholder="e.g., SGLT2 inhibitors"
+                                    />
+                                </div>
+
+                                {/* Comparator */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <i className="fas fa-balance-scale mr-1"></i>
+                                        Comparator
+                                    </label>
+                                    <textarea
+                                        value={criteria.comparator}
+                                        onChange={(e) => setCriteria(prev => ({ ...prev, comparator: e.target.value }))}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                        rows="2"
+                                        placeholder="e.g., Placebo or standard care"
+                                    />
+                                </div>
+
+                                {/* Outcome */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <i className="fas fa-chart-line mr-1"></i>
+                                        Outcome *
+                                    </label>
+                                    <textarea
+                                        value={criteria.outcome}
+                                        onChange={(e) => setCriteria(prev => ({ ...prev, outcome: e.target.value }))}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                        rows="2"
+                                        placeholder="e.g., Cardiovascular outcomes, HbA1c reduction"
+                                    />
+                                </div>
+
+                                {/* Study Designs */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <i className="fas fa-flask mr-1"></i>
+                                        Acceptable Study Designs
+                                    </label>
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                        {studyDesignOptions.map(design => (
+                                            <label key={design} className="flex items-center">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={criteria.studyDesigns.includes(design)}
+                                                    onChange={() => handleStudyDesignToggle(design)}
+                                                    className="mr-2"
+                                                />
+                                                <span className="text-sm">{design}</span>
+                                            </label>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* Additional Criteria */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <i className="fas fa-plus-circle mr-1"></i>
+                                        Additional Criteria
+                                    </label>
+                                    <div className="flex gap-2 mb-2">
+                                        <input
+                                            type="text"
+                                            value={additionalCriteriaKey}
+                                            onChange={(e) => setAdditionalCriteriaKey(e.target.value)}
+                                            className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
+                                            placeholder="Criteria name (e.g., Minimum follow-up)"
+                                        />
+                                        <input
+                                            type="text"
+                                            value={additionalCriteriaValue}
+                                            onChange={(e) => setAdditionalCriteriaValue(e.target.value)}
+                                            className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
+                                            placeholder="Value (e.g., 12 weeks)"
+                                        />
+                                        <button
+                                            onClick={addAdditionalCriteria}
+                                            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                                        >
+                                            Add
+                                        </button>
+                                    </div>
+                                    {Object.entries(criteria.additionalCriteria).map(([key, value]) => (
+                                        <div key={key} className="flex items-center justify-between bg-gray-50 p-2 rounded mb-1">
+                                            <span className="text-sm">
+                                                <strong>{key}:</strong> {value}
+                                            </span>
+                                            <button
+                                                onClick={() => removeAdditionalCriteria(key)}
+                                                className="text-red-500 hover:text-red-700"
+                                            >
+                                                <i className="fas fa-times"></i>
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="mt-8 flex justify-between">
+                                <button
+                                    onClick={() => setCurrentView('import')}
+                                    className="px-6 py-2 border border-gray-300 rounded-md hover:bg-gray-50"
+                                >
+                                    ← Back to Import
+                                </button>
+                                <button
+                                    onClick={validateAndProceed}
+                                    className="px-8 py-3 bg-green-600 text-white rounded-md hover:bg-green-700 font-medium"
+                                >
+                                    Start Screening →
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // ==================== Screening Interface Component ====================
+            const ScreeningInterface = () => {
+                const [currentIndex, setCurrentIndex] = useState(0);
+                const [showFullAbstract, setShowFullAbstract] = useState(false);
+                const [manualDecision, setManualDecision] = useState(null);
+                const [aiSuggestion, setAiSuggestion] = useState(null);
+                const [conflictMode, setConflictMode] = useState(false);
+                const [notes, setNotes] = useState('');
+
+                const currentRef = screeningQueue[currentIndex];
+
+                const handleDecision = async (decision) => {
+                    // Update the reference status
+                    const updatedRef = {
+                        ...currentRef,
+                        status: decision,
+                        screenedAt: new Date().toISOString(),
+                        notes: notes
+                    };
+
+                    // Add to results
+                    setScreeningResults(prev => [...prev, updatedRef]);
+
+                    // Update statistics
+                    setStatistics(prev => ({
+                        ...prev,
+                        screened: prev.screened + 1,
+                        pending: prev.pending - 1,
+                        included: decision === ScreeningDecision.INCLUDE ? prev.included + 1 : prev.included,
+                        excluded: decision === ScreeningDecision.EXCLUDE ? prev.excluded + 1 : prev.excluded
+                    }));
+
+                    // Clear notes and move to next
+                    setNotes('');
+                    setAiSuggestion(null);
+                    
+                    if (currentIndex < screeningQueue.length - 1) {
+                        setCurrentIndex(prev => prev + 1);
+                    } else {
+                        // Screening complete
+                        setCurrentView('results');
+                    }
+                };
+
+                const requestAiAssistance = async () => {
+                    setIsProcessing(true);
+                    
+                    // Simulate AI processing
+                    setTimeout(() => {
+                        setAiSuggestion({
+                            decision: Math.random() > 0.5 ? ScreeningDecision.INCLUDE : ScreeningDecision.EXCLUDE,
+                            confidence: Math.random() * 0.4 + 0.6,
+                            reasons: [
+                                'Meets population criteria',
+                                'Intervention matches search criteria',
+                                'Study design is appropriate'
+                            ],
+                            concerns: currentRef.abstract.length < 100 ? ['Abstract may be incomplete'] : []
+                        });
+                        setIsProcessing(false);
+                    }, 2000);
+                };
+
+                const skipToNext = () => {
+                    if (currentIndex < screeningQueue.length - 1) {
+                        setCurrentIndex(prev => prev + 1);
+                        setAiSuggestion(null);
+                        setNotes('');
+                    }
+                };
+
+                const goToPrevious = () => {
+                    if (currentIndex > 0) {
+                        setCurrentIndex(prev => prev - 1);
+                        setAiSuggestion(null);
+                        setNotes('');
+                    }
+                };
+
+                if (!currentRef) {
+                    return (
+                        <div className="text-center py-12">
+                            <i className="fas fa-check-circle text-6xl text-green-500 mb-4"></i>
+                            <h3 className="text-2xl font-bold">All references screened!</h3>
+                            <button
+                                onClick={() => setCurrentView('results')}
+                                className="mt-4 px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                            >
+                                View Results
+                            </button>
+                        </div>
+                    );
+                }
+
+                return (
+                    <div className="max-w-7xl mx-auto p-6">
+                        {/* Progress Bar */}
+                        <div className="bg-white rounded-lg shadow-md p-4 mb-6">
+                            <div className="flex justify-between items-center mb-2">
+                                <span className="text-sm font-medium">
+                                    Progress: {currentIndex + 1} / {screeningQueue.length}
+                                </span>
+                                <span className="text-sm text-gray-600">
+                                    {Math.round(((currentIndex + 1) / screeningQueue.length) * 100)}%
+                                </span>
+                            </div>
+                            <div className="w-full bg-gray-200 rounded-full h-2">
+                                <div 
+                                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                                    style={{ width: `${((currentIndex + 1) / screeningQueue.length) * 100}%` }}
+                                ></div>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            {/* Main Paper Display */}
+                            <div className="lg:col-span-2 bg-white rounded-lg shadow-lg p-6">
+                                <div className="mb-4">
+                                    <div className="flex justify-between items-start mb-2">
+                                        <h3 className="text-xl font-bold text-gray-800">
+                                            {currentRef.title}
+                                        </h3>
+                                        <span className="text-sm bg-gray-100 px-2 py-1 rounded">
+                                            {currentRef.id}
+                                        </span>
+                                    </div>
+                                    <p className="text-sm text-gray-600 mb-2">
+                                        {currentRef.authors} ({currentRef.year})
+                                    </p>
+                                    <p className="text-sm italic text-gray-500">
+                                        {currentRef.journal}
+                                    </p>
+                                </div>
+
+                                <div className="border-t pt-4">
+                                    <h4 className="font-semibold mb-2">Abstract</h4>
+                                    <div className={`text-gray-700 ${!showFullAbstract ? 'line-clamp-6' : ''}`}>
+                                        {currentRef.abstract || 'No abstract available'}
+                                    </div>
+                                    {currentRef.abstract && currentRef.abstract.length > 500 && (
+                                        <button
+                                            onClick={() => setShowFullAbstract(!showFullAbstract)}
+                                            className="text-blue-600 hover:text-blue-800 text-sm mt-2"
+                                        >
+                                            {showFullAbstract ? 'Show less' : 'Show full abstract'}
+                                        </button>
+                                    )}
+                                </div>
+
+                                {/* Notes Section */}
+                                <div className="mt-6">
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Screening Notes
+                                    </label>
+                                    <textarea
+                                        value={notes}
+                                        onChange={(e) => setNotes(e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                        rows="3"
+                                        placeholder="Add any notes about this screening decision..."
+                                    />
+                                </div>
+
+                                {/* AI Suggestion */}
+                                {aiSuggestion && (
+                                    <div className="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
+                                        <h4 className="font-semibold mb-2 text-blue-900">
+                                            <i className="fas fa-robot mr-2"></i>
+                                            AI Suggestion
+                                        </h4>
+                                        <div className="space-y-2">
+                                            <p>
+                                                <strong>Decision:</strong> 
+                                                <span className={`ml-2 px-2 py-1 rounded text-sm ${
+                                                    aiSuggestion.decision === ScreeningDecision.INCLUDE 
+                                                        ? 'bg-green-100 text-green-800' 
+                                                        : 'bg-red-100 text-red-800'
+                                                }`}>
+                                                    {aiSuggestion.decision.toUpperCase()}
+                                                </span>
+                                                <span className="ml-2 text-sm text-gray-600">
+                                                    (Confidence: {Math.round(aiSuggestion.confidence * 100)}%)
+                                                </span>
+                                            </p>
+                                            <div>
+                                                <strong>Reasons:</strong>
+                                                <ul className="ml-4 mt-1 text-sm">
+                                                    {aiSuggestion.reasons.map((reason, idx) => (
+                                                        <li key={idx}>• {reason}</li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+                                            {aiSuggestion.concerns.length > 0 && (
+                                                <div>
+                                                    <strong>Concerns:</strong>
+                                                    <ul className="ml-4 mt-1 text-sm text-orange-700">
+                                                        {aiSuggestion.concerns.map((concern, idx) => (
+                                                            <li key={idx}>• {concern}</li>
+                                                        ))}
+                                                    </ul>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Decision Buttons */}
+                                <div className="mt-6 flex gap-3">
+                                    <button
+                                        onClick={() => handleDecision(ScreeningDecision.INCLUDE)}
+                                        className="flex-1 px-6 py-3 bg-green-600 text-white rounded-md hover:bg-green-700 font-medium"
+                                    >
+                                        <i className="fas fa-check mr-2"></i>
+                                        Include
+                                    </button>
+                                    <button
+                                        onClick={() => handleDecision(ScreeningDecision.EXCLUDE)}
+                                        className="flex-1 px-6 py-3 bg-red-600 text-white rounded-md hover:bg-red-700 font-medium"
+                                    >
+                                        <i className="fas fa-times mr-2"></i>
+                                        Exclude
+                                    </button>
+                                    <button
+                                        onClick={() => handleDecision(ScreeningDecision.MAYBE)}
+                                        className="flex-1 px-6 py-3 bg-yellow-600 text-white rounded-md hover:bg-yellow-700 font-medium"
+                                    >
+                                        <i className="fas fa-question mr-2"></i>
+                                        Maybe
+                                    </button>
+                                </div>
+
+                                {/* Navigation */}
+                                <div className="mt-4 flex justify-between">
+                                    <button
+                                        onClick={goToPrevious}
+                                        disabled={currentIndex === 0}
+                                        className="px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
+                                    >
+                                        ← Previous
+                                    </button>
+                                    <button
+                                        onClick={skipToNext}
+                                        disabled={currentIndex === screeningQueue.length - 1}
+                                        className="px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
+                                    >
+                                        Skip →
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Side Panel */}
+                            <div className="space-y-6">
+                                {/* Criteria Reminder */}
+                                <div className="bg-white rounded-lg shadow-lg p-6">
+                                    <h4 className="font-semibold mb-3">
+                                        <i className="fas fa-list-check mr-2"></i>
+                                        Inclusion Criteria
+                                    </h4>
+                                    <div className="space-y-2 text-sm">
+                                        <div>
+                                            <strong>P:</strong> {criteria.population}
+                                        </div>
+                                        <div>
+                                            <strong>I:</strong> {criteria.intervention}
+                                        </div>
+                                        {criteria.comparator && (
+                                            <div>
+                                                <strong>C:</strong> {criteria.comparator}
+                                            </div>
+                                        )}
+                                        <div>
+                                            <strong>O:</strong> {criteria.outcome}
+                                        </div>
+                                        {criteria.studyDesigns.length > 0 && (
+                                            <div>
+                                                <strong>Study Types:</strong> {criteria.studyDesigns.join(', ')}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* AI Assistant */}
+                                <div className="bg-white rounded-lg shadow-lg p-6">
+                                    <h4 className="font-semibold mb-3">
+                                        <i className="fas fa-robot mr-2"></i>
+                                        AI Assistant
+                                    </h4>
+                                    <button
+                                        onClick={requestAiAssistance}
+                                        disabled={isProcessing || aiSuggestion}
+                                        className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+                                    >
+                                        {isProcessing ? (
+                                            <>
+                                                <i className="fas fa-spinner fa-spin mr-2"></i>
+                                                Analyzing...
+                                            </>
+                                        ) : aiSuggestion ? (
+                                            'Suggestion Available'
+                                        ) : (
+                                            'Get AI Suggestion'
+                                        )}
+                                    </button>
+                                </div>
+
+                                {/* Statistics */}
+                                <div className="bg-white rounded-lg shadow-lg p-6">
+                                    <h4 className="font-semibold mb-3">
+                                        <i className="fas fa-chart-bar mr-2"></i>
+                                        Session Statistics
+                                    </h4>
+                                    <div className="space-y-2 text-sm">
+                                        <div className="flex justify-between">
+                                            <span>Total:</span>
+                                            <span className="font-medium">{statistics.total}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span>Screened:</span>
+                                            <span className="font-medium">{statistics.screened}</span>
+                                        </div>
+                                        <div className="flex justify-between text-green-600">
+                                            <span>Included:</span>
+                                            <span className="font-medium">{statistics.included}</span>
+                                        </div>
+                                        <div className="flex justify-between text-red-600">
+                                            <span>Excluded:</span>
+                                            <span className="font-medium">{statistics.excluded}</span>
+                                        </div>
+                                        <div className="flex justify-between text-yellow-600">
+                                            <span>Pending:</span>
+                                            <span className="font-medium">{statistics.pending}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // ==================== Results Component ====================
+            const ResultsView = () => {
+                const [exportFormat, setExportFormat] = useState('csv');
+
+                const exportResults = () => {
+                    const included = screeningResults.filter(r => r.status === ScreeningDecision.INCLUDE);
+                    const excluded = screeningResults.filter(r => r.status === ScreeningDecision.EXCLUDE);
+                    const maybe = screeningResults.filter(r => r.status === ScreeningDecision.MAYBE);
+
+                    let content = '';
+                    
+                    if (exportFormat === 'csv') {
+                        content = 'ID,Title,Authors,Year,Decision,Notes\n';
+                        screeningResults.forEach(ref => {
+                            content += `"${ref.id}","${ref.title}","${ref.authors}","${ref.year}","${ref.status}","${ref.notes || ''}"\n`;
+                        });
+                    } else if (exportFormat === 'json') {
+                        content = JSON.stringify(screeningResults, null, 2);
+                    }
+
+                    const blob = new Blob([content], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `screening_results.${exportFormat}`;
+                    a.click();
+                };
+
+                return (
+                    <div className="max-w-7xl mx-auto p-6">
+                        <div className="bg-white rounded-lg shadow-lg p-8">
+                            <h2 className="text-2xl font-bold mb-6 text-gray-800">
+                                <i className="fas fa-chart-pie mr-2"></i>
+                                Screening Results
+                            </h2>
+
+                            {/* Summary Statistics */}
+                            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+                                <div className="bg-blue-50 p-4 rounded-lg">
+                                    <div className="text-2xl font-bold text-blue-600">{statistics.total}</div>
+                                    <div className="text-sm text-gray-600">Total References</div>
+                                </div>
+                                <div className="bg-green-50 p-4 rounded-lg">
+                                    <div className="text-2xl font-bold text-green-600">{statistics.included}</div>
+                                    <div className="text-sm text-gray-600">Included</div>
+                                </div>
+                                <div className="bg-red-50 p-4 rounded-lg">
+                                    <div className="text-2xl font-bold text-red-600">{statistics.excluded}</div>
+                                    <div className="text-sm text-gray-600">Excluded</div>
+                                </div>
+                                <div className="bg-yellow-50 p-4 rounded-lg">
+                                    <div className="text-2xl font-bold text-yellow-600">
+                                        {screeningResults.filter(r => r.status === ScreeningDecision.MAYBE).length}
+                                    </div>
+                                    <div className="text-sm text-gray-600">Maybe/Review</div>
+                                </div>
+                            </div>
+
+                            {/* Results Table */}
+                            <div className="overflow-x-auto">
+                                <table className="min-w-full divide-y divide-gray-200">
+                                    <thead className="bg-gray-50">
+                                        <tr>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Title
+                                            </th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Authors
+                                            </th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Year
+                                            </th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Decision
+                                            </th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Notes
+                                            </th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-gray-200">
+                                        {screeningResults.map((ref, idx) => (
+                                            <tr key={idx}>
+                                                <td className="px-6 py-4 text-sm font-medium text-gray-900">
+                                                    {ref.title}
+                                                </td>
+                                                <td className="px-6 py-4 text-sm text-gray-500">
+                                                    {ref.authors?.split(';')[0]}...
+                                                </td>
+                                                <td className="px-6 py-4 text-sm text-gray-500">
+                                                    {ref.year}
+                                                </td>
+                                                <td className="px-6 py-4">
+                                                    <span className={`px-2 py-1 text-xs rounded-full ${
+                                                        ref.status === ScreeningDecision.INCLUDE 
+                                                            ? 'bg-green-100 text-green-800'
+                                                            : ref.status === ScreeningDecision.EXCLUDE
+                                                            ? 'bg-red-100 text-red-800'
+                                                            : 'bg-yellow-100 text-yellow-800'
+                                                    }`}>
+                                                        {ref.status}
+                                                    </span>
+                                                </td>
+                                                <td className="px-6 py-4 text-sm text-gray-500">
+                                                    {ref.notes || '-'}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            {/* Export Options */}
+                            <div className="mt-8 flex justify-between items-center">
+                                <div className="flex gap-4 items-center">
+                                    <label className="text-sm font-medium">Export as:</label>
+                                    <select
+                                        value={exportFormat}
+                                        onChange={(e) => setExportFormat(e.target.value)}
+                                        className="px-3 py-2 border border-gray-300 rounded-md"
+                                    >
+                                        <option value="csv">CSV</option>
+                                        <option value="json">JSON</option>
+                                        <option value="ris">RIS (coming soon)</option>
+                                    </select>
+                                </div>
+                                <button
+                                    onClick={exportResults}
+                                    className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                                >
+                                    <i className="fas fa-download mr-2"></i>
+                                    Export Results
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // ==================== Main Render ====================
+            return (
+                <div className="min-h-screen bg-gray-100">
+                    {/* Header */}
+                    <header className="bg-white shadow-md">
+                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="flex justify-between items-center py-4">
+                                <div className="flex items-center">
+                                    <i className="fas fa-microscope text-3xl text-blue-600 mr-3"></i>
+                                    <div>
+                                        <h1 className="text-2xl font-bold text-gray-900">
+                                            AI-Powered Systematic Review Screening
+                                        </h1>
+                                        <p className="text-sm text-gray-600">Intelligent Abstract Screening Assistant</p>
+                                    </div>
+                                </div>
+                                <nav className="flex space-x-4">
+                                    <button
+                                        onClick={() => setCurrentView('import')}
+                                        className={`px-4 py-2 rounded-md ${currentView === 'import' ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                                    >
+                                        Import
+                                    </button>
+                                    <button
+                                        onClick={() => setCurrentView('criteria')}
+                                        className={`px-4 py-2 rounded-md ${currentView === 'criteria' ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                                        disabled={references.length === 0}
+                                    >
+                                        Criteria
+                                    </button>
+                                    <button
+                                        onClick={() => setCurrentView('screening')}
+                                        className={`px-4 py-2 rounded-md ${currentView === 'screening' ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                                        disabled={references.length === 0 || !criteria.population}
+                                    >
+                                        Screening
+                                    </button>
+                                    <button
+                                        onClick={() => setCurrentView('results')}
+                                        className={`px-4 py-2 rounded-md ${currentView === 'results' ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                                        disabled={screeningResults.length === 0}
+                                    >
+                                        Results
+                                    </button>
+                                </nav>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* Main Content */}
+                    <main className="py-8">
+                        {currentView === 'import' && <ImportReferences />}
+                        {currentView === 'criteria' && <CriteriaSetup />}
+                        {currentView === 'screening' && <ScreeningInterface />}
+                        {currentView === 'results' && <ResultsView />}
+                    </main>
+                </div>
+            );
+        }
+
+        // Render the app
+        ReactDOM.render(<SystematicReviewApp />, document.getElementById('root'));
+    </script>
+</body>
+</html>

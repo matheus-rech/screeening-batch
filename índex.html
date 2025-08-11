@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI-Powered Systematic Review Screening</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        .line-clamp-6 {
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 6;
+        }
+        .details-row {
+            background-color: #f9fafb; /* gray-50 */
+        }
+        .reason-list li { margin-bottom: 0.25rem; }
+        .nav-button {
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem;
+            font-weight: 500;
+            transition: background-color 0.2s;
+        }
+        .nav-button.active {
+            background-color: #eef2ff; /* indigo-50 */
+            color: #4f46e5; /* indigo-600 */
+        }
+        .nav-button:not(.active) {
+            color: #4b5563; /* gray-600 */
+        }
+        .nav-button:not(:disabled):hover {
+            background-color: #f3f4f6; /* gray-100 */
+        }
+        .nav-button:disabled {
+            color: #9ca3af; /* gray-400 */
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+        // --- API Client ---
+        const API_BASE_URL = 'http://localhost:8000'; // Your backend URL
+
+        const apiClient = {
+            createJob: async (references, criteria) => {
+                const response = await fetch(`${API_BASE_URL}/api/jobs`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ references, criteria })
+                });
+                if (!response.ok) throw new Error(`Failed to create job: ${response.statusText}`);
+                return response.json();
+            },
+            getJobStatus: async (sessionId) => {
+                const response = await fetch(`${API_BASE_URL}/api/jobs/${sessionId}`);
+                if (!response.ok) return null;
+                return response.json();
+            },
+            getConflicts: async (sessionId) => {
+                const response = await fetch(`${API_BASE_URL}/api/jobs/${sessionId}/conflicts`);
+                if (!response.ok) throw new Error('Failed to fetch conflicts');
+                return response.json();
+            },
+            resolveConflict: async (sessionId, resolution) => {
+                const response = await fetch(`${API_BASE_URL}/api/jobs/${sessionId}/resolve`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(resolution)
+                });
+                if (!response.ok) throw new Error('Failed to resolve conflict');
+                return response.json();
+            },
+            getResults: async (sessionId) => {
+                const response = await fetch(`${API_BASE_URL}/api/jobs/${sessionId}/results`);
+                if (!response.ok) throw new Error('Failed to fetch results');
+                return response.json();
+            }
+        };
+
+        // --- Main Application Component ---
+        function SystematicReviewApp() {
+            const [currentView, setCurrentView] = useState('import');
+            const [references, setReferences] = useState([]);
+            const [criteria, setCriteria] = useState({
+                population: '',
+                intervention: '',
+                comparator: '',
+                outcome: '',
+                studyDesigns: [],
+                additionalCriteria: {}
+            });
+            const [sessionId, setSessionId] = useState(null);
+            const [jobStatus, setJobStatus] = useState(null);
+            // State for handling submission process
+            const [isSubmitting, setIsSubmitting] = useState(false);
+            const [submitError, setSubmitError] = useState(null);
+
+            // Persist session ID to survive page reloads
+            useEffect(() => {
+                const savedSessionId = localStorage.getItem('screening_session_id');
+                if (savedSessionId) {
+                    setSessionId(savedSessionId);
+                    apiClient.getJobStatus(savedSessionId).then(status => {
+                        if (status) {
+                            setJobStatus(status);
+                            if (status.status === 'completed') setCurrentView('results');
+                            else if (status.status === 'pending_conflict_resolution') setCurrentView('conflict_resolution');
+                            else setCurrentView('progress');
+                        } else {
+                            resetApp();
+                        }
+                    });
+                }
+            }, []);
+
+            const handleJobSubmit = async () => {
+                setIsSubmitting(true);
+                setSubmitError(null);
+                try {
+                    const data = await apiClient.createJob(references, criteria);
+                    setSessionId(data.session_id);
+                    localStorage.setItem('screening_session_id', data.session_id);
+                    setCurrentView('progress');
+                } catch (error) {
+                    console.error("Job submission failed:", error);
+                    setSubmitError("Failed to start screening job. Please ensure the backend server is running and accessible.");
+                } finally {
+                    setIsSubmitting(false);
+                }
+            };
+            
+            const resetApp = () => {
+                setReferences([]);
+                setCriteria({ population: '', intervention: '', comparator: '', outcome: '', studyDesigns: [], additionalCriteria: {} });
+                setSessionId(null);
+                setJobStatus(null);
+                setSubmitError(null);
+                setIsSubmitting(false);
+                localStorage.removeItem('screening_session_id');
+                setCurrentView('import');
+            };
+
+            const renderView = () => {
+                switch(currentView) {
+                    case 'import': return <ImportReferences setReferences={setReferences} onComplete={() => setCurrentView('criteria')} />;
+                    case 'criteria': return <CriteriaSetup 
+                                                criteria={criteria} 
+                                                setCriteria={setCriteria} 
+                                                onBack={() => setCurrentView('import')} 
+                                                onComplete={handleJobSubmit} 
+                                                isSubmitting={isSubmitting}
+                                                submitError={submitError}
+                                            />;
+                    case 'progress': return <JobProgress sessionId={sessionId} onConflictsReady={() => setCurrentView('conflict_resolution')} onComplete={() => setCurrentView('results')} />;
+                    case 'conflict_resolution': return <ConflictResolutionInterface sessionId={sessionId} criteria={criteria} onComplete={() => setCurrentView('results')} />;
+                    case 'results': return <ResultsView sessionId={sessionId} onReset={resetApp} />;
+                    default: return <ImportReferences setReferences={setReferences} onComplete={() => setCurrentView('criteria')} />;
+                }
+            };
+
+            const NavButton = ({ view, label, disabled = false }) => (
+                <button
+                    onClick={() => setCurrentView(view)}
+                    className={`nav-button ${currentView === view ? 'active' : ''}`}
+                    disabled={disabled}
+                >
+                    {label}
+                </button>
+            );
+
+            return (
+                <div className="min-h-screen bg-gray-100">
+                    <header className="bg-white shadow-md sticky top-0 z-10">
+                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="flex justify-between items-center py-4">
+                                <div className="flex items-center">
+                                    <i className="fas fa-microscope text-3xl text-blue-600 mr-3"></i>
+                                    <div>
+                                        <h1 className="text-xl font-bold text-gray-900">AI-Powered Systematic Review Screening</h1>
+                                        <p className="text-sm text-gray-600">Intelligent Abstract Screening Assistant</p>
+                                    </div>
+                                </div>
+                                <nav className="flex space-x-2">
+                                    <NavButton view="import" label="Import" />
+                                    <NavButton view="criteria" label="Criteria" disabled={references.length === 0} />
+                                    <NavButton view="conflict_resolution" label="Screening" disabled={!jobStatus || jobStatus.status !== 'pending_conflict_resolution'} />
+                                    <NavButton view="results" label="Results" disabled={!jobStatus || (jobStatus.status !== 'completed' && jobStatus.status !== 'pending_conflict_resolution')} />
+                                </nav>
+                            </div>
+                        </div>
+                    </header>
+                    <main className="py-10">{renderView()}</main>
+                </div>
+            );
+        }
+
+        function ImportReferences({ setReferences, onComplete }) {
+            const [previewData, setPreviewData] = useState(null);
+            const [importFormat, setImportFormat] = useState('auto');
+            const fileInputRef = useRef(null);
+            
+            const handleFiles = (files) => {
+                const file = files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (e) => parseReferences(e.target.result, file.name, importFormat);
+                reader.readAsText(file);
+            };
+
+            const parseReferences = (content, filename, format) => {
+                let effectiveFormat = format;
+                if (format === 'auto') {
+                    if (filename.endsWith('.ris')) effectiveFormat = 'ris';
+                    else if (filename.endsWith('.bib')) effectiveFormat = 'bib';
+                    else if (filename.endsWith('.xml')) effectiveFormat = 'xml';
+                    else if (filename.endsWith('.csv')) effectiveFormat = 'csv';
+                }
+
+                let parsed = [];
+                const commonParser = (ref) => ({ ...ref, id: ref.id || `ref_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` });
+
+                switch(effectiveFormat) {
+                    case 'csv':
+                        Papa.parse(content, {
+                            header: true, skipEmptyLines: true,
+                            complete: (results) => {
+                                parsed = results.data.map(row => commonParser({
+                                    title: row.Title || row.title || '', abstract: row.Abstract || row.abstract || '',
+                                    authors: row.Authors || row.authors || '', year: row.Year || row.year || '',
+                                    journal: row.Journal || row.journal || '',
+                                }));
+                                setPreviewData(parsed);
+                            }
+                        });
+                        break;
+                    case 'ris':
+                    case 'bib':
+                    case 'xml':
+                        alert(`Parsing for ${effectiveFormat.toUpperCase()} is a placeholder. This demo fully supports CSV.`);
+                        parsed = [{id: `demo_${effectiveFormat}`, title: `Example Paper from ${effectiveFormat.toUpperCase()}`, abstract: 'This is a sample abstract.'}];
+                        setPreviewData(parsed);
+                        break;
+                    default:
+                        alert('Could not detect file format. Please select it manually.');
+                        setPreviewData(null);
+                }
+            };
+
+            const confirmImport = () => {
+                if (previewData) {
+                    setReferences(previewData);
+                    onComplete();
+                }
+            };
+            
+            return (
+                <div className="max-w-4xl mx-auto px-4">
+                    <div className="bg-white rounded-lg shadow-lg p-8">
+                        <h2 className="text-xl font-bold mb-6 text-gray-800"><i className="fas fa-file-import mr-3 text-gray-400"></i>Import References</h2>
+                        <div className="mb-4">
+                            <label className="block text-sm font-medium text-gray-700 mb-1">Import Format</label>
+                            <select value={importFormat} onChange={(e) => setImportFormat(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-50">
+                                <option value="auto">Auto-detect</option>
+                                <option value="csv">CSV</option>
+                                <option value="ris">RIS</option>
+                                <option value="bib">BibTeX</option>
+                                <option value="xml">PubMed XML</option>
+                            </select>
+                        </div>
+                        <div 
+                            className="border-2 border-dashed rounded-lg p-12 text-center transition-colors border-gray-300 hover:border-blue-400 bg-gray-50"
+                            onDragOver={(e) => e.preventDefault()}
+                            onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}
+                        >
+                            <i className="fas fa-cloud-upload-alt text-5xl text-gray-400 mb-4"></i>
+                            <p className="text-lg mb-2 text-gray-700">Drag and drop your reference file here</p>
+                            <p className="text-gray-500 mb-4">or</p>
+                            <input ref={fileInputRef} type="file" onChange={(e) => handleFiles(e.target.files)} className="hidden" accept=".csv,.ris,.bib,.xml" />
+                            <button onClick={() => fileInputRef.current?.click()} className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 font-semibold">Browse Files</button>
+                             <p className="text-sm text-gray-500 mt-4">Supported formats: RIS, BibTeX, PubMed XML, CSV</p>
+                        </div>
+                        {previewData && (
+                            <div className="mt-8">
+                                <p className="text-green-800 bg-green-50 p-3 rounded-md mb-4"><i className="fas fa-check-circle mr-2"></i>Successfully parsed {previewData.length} references.</p>
+                                <button onClick={confirmImport} className="w-full mt-4 px-8 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 font-medium text-lg">Proceed to Criteria Setup →</button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        function CriteriaSetup({ criteria, setCriteria, onBack, onComplete, isSubmitting, submitError }) {
+            const [studyDesignOptions] = useState([
+                'RCT', 'Cohort Study', 'Case-Control', 'Cross-Sectional', 
+                'Systematic Review', 'Meta-Analysis', 'Case Series', 'Case Report'
+            ]);
+            const [additionalKey, setAdditionalKey] = useState('');
+            const [additionalValue, setAdditionalValue] = useState('');
+
+            const handleInputChange = (field, value) => setCriteria(prev => ({ ...prev, [field]: value }));
+            
+            const handleStudyDesignToggle = (design) => {
+                setCriteria(prev => ({
+                    ...prev,
+                    studyDesigns: prev.studyDesigns.includes(design)
+                        ? prev.studyDesigns.filter(d => d !== design)
+                        : [...prev.studyDesigns, design]
+                }));
+            };
+
+            const addAdditionalCriteria = () => {
+                if (additionalKey && additionalValue) {
+                    setCriteria(prev => ({
+                        ...prev,
+                        additionalCriteria: { ...prev.additionalCriteria, [additionalKey]: additionalValue }
+                    }));
+                    setAdditionalKey('');
+                    setAdditionalValue('');
+                }
+            };
+
+            const removeAdditionalCriteria = (key) => {
+                setCriteria(prev => {
+                    const newCriteria = { ...prev.additionalCriteria };
+                    delete newCriteria[key];
+                    return { ...prev, additionalCriteria: newCriteria };
+                });
+            };
+
+            const validateAndProceed = () => {
+                if (!criteria.population || !criteria.intervention || !criteria.outcome) {
+                    alert('Please fill in at least Population, Intervention, and Outcome.');
+                    return;
+                }
+                onComplete();
+            };
+
+            return (
+                <div className="max-w-4xl mx-auto px-4">
+                    <div className="bg-white rounded-lg shadow-lg p-8">
+                        <h2 className="text-xl font-bold mb-6 text-gray-800"><i className="fas fa-list-check mr-3 text-gray-400"></i>Define Inclusion Criteria</h2>
+                        <div className="space-y-6">
+                            {/* PICO */}
+                            <div className="p-4 border rounded-md">
+                                <h3 className="font-semibold mb-2">PICO</h3>
+                                <div className="space-y-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Population *</label>
+                                        <textarea value={criteria.population} onChange={(e) => handleInputChange('population', e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-md" rows="2" placeholder="e.g., Adults with type 2 diabetes"/>
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Intervention *</label>
+                                        <textarea value={criteria.intervention} onChange={(e) => handleInputChange('intervention', e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-md" rows="2" placeholder="e.g., SGLT2 inhibitors"/>
+                                    </div>
+                                     <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Comparator</label>
+                                        <textarea value={criteria.comparator} onChange={(e) => handleInputChange('comparator', e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-md" rows="2" placeholder="e.g., Placebo or standard care"/>
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Outcome *</label>
+                                        <textarea value={criteria.outcome} onChange={(e) => handleInputChange('outcome', e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-md" rows="2" placeholder="e.g., Cardiovascular outcomes"/>
+                                    </div>
+                                </div>
+                            </div>
+                            {/* Study Designs */}
+                            <div className="p-4 border rounded-md">
+                                <h3 className="font-semibold mb-2">Acceptable Study Designs</h3>
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                    {studyDesignOptions.map(design => (
+                                        <label key={design} className="flex items-center space-x-2 cursor-pointer">
+                                            <input type="checkbox" checked={criteria.studyDesigns.includes(design)} onChange={() => handleStudyDesignToggle(design)} className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"/>
+                                            <span className="text-sm text-gray-700">{design}</span>
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
+                            {/* Additional Criteria */}
+                            <div className="p-4 border rounded-md">
+                                <h3 className="font-semibold mb-2">Additional Criteria</h3>
+                                {Object.entries(criteria.additionalCriteria).map(([key, value]) => (
+                                    <div key={key} className="flex items-center justify-between bg-gray-50 p-2 rounded mb-1 text-sm">
+                                        <span><strong>{key}:</strong> {value}</span>
+                                        <button onClick={() => removeAdditionalCriteria(key)} className="text-red-500 hover:text-red-700">&times;</button>
+                                    </div>
+                                ))}
+                                <div className="flex gap-2 mt-2">
+                                    <input type="text" value={additionalKey} onChange={(e) => setAdditionalKey(e.target.value)} className="flex-1 px-3 py-2 border border-gray-300 rounded-md" placeholder="Criteria name (e.g., Minimum follow-up)"/>
+                                    <input type="text" value={additionalValue} onChange={(e) => setAdditionalValue(e.target.value)} className="flex-1 px-3 py-2 border border-gray-300 rounded-md" placeholder="Value (e.g., > 12 weeks)"/>
+                                    <button onClick={addAdditionalCriteria} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">Add</button>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        {submitError && (
+                            <div className="mt-6 p-3 bg-red-100 border border-red-400 text-red-800 rounded-md text-sm">
+                                <p><strong><i className="fas fa-exclamation-triangle mr-2"></i>Submission Failed:</strong> {submitError}</p>
+                            </div>
+                        )}
+
+                        <div className="mt-8 flex justify-between">
+                            <button onClick={onBack} className="px-6 py-2 border border-gray-300 rounded-md hover:bg-gray-50" disabled={isSubmitting}>← Back to Import</button>
+                            <button onClick={validateAndProceed} className="px-8 py-3 bg-green-600 text-white rounded-md hover:bg-green-700 font-medium text-lg disabled:opacity-50 disabled:cursor-wait" disabled={isSubmitting}>
+                                {isSubmitting ? (
+                                    <><i className="fas fa-spinner fa-spin mr-2"></i>Submitting...</>
+                                ) : (
+                                    <><i className="fas fa-rocket mr-2"></i>Start Automated Screening →</>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function JobProgress({ sessionId, onConflictsReady, onComplete }) {
+            const [jobStatus, setJobStatus] = useState(null);
+            const intervalRef = useRef(null);
+
+            const fetchStatus = useCallback(async () => {
+                if (!sessionId) return;
+                try {
+                    const data = await apiClient.getJobStatus(sessionId);
+                    if (data) {
+                        setJobStatus(data);
+                        if (data.status === 'pending_conflict_resolution') {
+                            clearInterval(intervalRef.current);
+                            onConflictsReady();
+                        } else if (data.status === 'completed') {
+                            clearInterval(intervalRef.current);
+                            onComplete();
+                        }
+                    }
+                } catch (error) {
+                    console.error("Failed to fetch job status:", error);
+                    clearInterval(intervalRef.current);
+                }
+            }, [sessionId, onConflictsReady, onComplete]);
+
+            useEffect(() => {
+                fetchStatus();
+                intervalRef.current = setInterval(fetchStatus, 5000);
+                return () => clearInterval(intervalRef.current);
+            }, [fetchStatus]);
+
+            const percentage = jobStatus ? Math.round((parseInt(jobStatus.processed_count, 10) / parseInt(jobStatus.total_papers, 10)) * 100) || 0 : 0;
+
+            return (
+                <div className="max-w-2xl mx-auto p-6 text-center">
+                    <div className="bg-white rounded-lg shadow-lg p-12">
+                        <h2 className="text-2xl font-bold mb-4 text-gray-800">Automated Screening in Progress...</h2>
+                        <i className="fas fa-cogs fa-spin text-6xl text-blue-500 mb-6"></i>
+                        <p className="text-gray-600 mb-6">The AI is performing dual-screening on your references. You can safely close this window and come back later.</p>
+                        <div className="w-full bg-gray-200 rounded-full h-4">
+                            <div className="bg-blue-600 h-4 rounded-full transition-all duration-300" style={{ width: `${percentage}%` }}></div>
+                        </div>
+                        <p className="mt-4 text-lg font-semibold">{percentage}% Complete</p>
+                        <p className="text-sm text-gray-500">({jobStatus?.processed_count || 0} / {jobStatus?.total_papers || 0} papers processed)</p>
+                    </div>
+                </div>
+            );
+        }
+
+        function ConflictResolutionInterface({ sessionId, criteria, onComplete }) {
+            const [queue, setQueue] = useState([]);
+            const [currentIndex, setCurrentIndex] = useState(0);
+            const [isLoading, setIsLoading] = useState(true);
+            const [notes, setNotes] = useState('');
+            const [showFullAbstract, setShowFullAbstract] = useState(false);
+            
+            useEffect(() => {
+                const fetchConflicts = async () => {
+                    try {
+                        const data = await apiClient.getConflicts(sessionId);
+                        setQueue(data.conflicts);
+                    } catch (error) { console.error("Failed to fetch conflicts:", error); } 
+                    finally { setIsLoading(false); }
+                };
+                fetchConflicts();
+            }, [sessionId]);
+
+            const handleDecision = async (decision) => {
+                const currentConflict = queue[currentIndex];
+                const resolution = { paper_id: currentConflict.paper_id, decision, notes };
+                
+                try {
+                    await apiClient.resolveConflict(sessionId, resolution);
+                    if (currentIndex < queue.length - 1) {
+                        setCurrentIndex(prev => prev + 1);
+                        setNotes('');
+                        setShowFullAbstract(false);
+                    } else {
+                        alert("All conflicts resolved! Taking you to the final results.");
+                        onComplete();
+                    }
+                } catch (error) { alert("Failed to save resolution. Please try again."); }
+            };
+            
+            if (isLoading) return <div className="text-center p-12"><i className="fas fa-spinner fa-spin text-4xl"></i><p>Loading Conflict Queue...</p></div>;
+            if (queue.length === 0) {
+                 return (
+                    <div className="text-center p-12">
+                        <i className="fas fa-check-circle text-6xl text-green-500 mb-4"></i>
+                        <h3 className="text-2xl font-bold">No conflicts found!</h3>
+                        <button onClick={onComplete} className="mt-4 px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">View All Results</button>
+                    </div>
+                );
+            }
+
+            const currentConflict = queue[currentIndex];
+            const { reference, reviewer1, reviewer2 } = currentConflict;
+            
+            const ReviewerCard = ({ review }) => (
+                <div className={`p-4 rounded-lg border ${review.decision === 'include' ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
+                    <h5 className="font-bold text-lg mb-2">
+                        {review.reviewer_type.charAt(0).toUpperCase() + review.reviewer_type.slice(1)} says: 
+                        <span className={`ml-2 px-2 py-1 rounded text-sm font-medium ${review.decision === 'include' ? 'bg-green-200 text-green-800' : 'bg-red-200 text-red-800'}`}>{review.decision.toUpperCase()}</span>
+                    </h5>
+                    <p className="text-sm font-semibold">Reasons:</p>
+                    <ul className="list-disc list-inside text-sm text-gray-700 reason-list">
+                        {(review.reasons || []).map((r, i) => <li key={i}>{r}</li>)}
+                    </ul>
+                </div>
+            );
+
+            return (
+                <div className="max-w-7xl mx-auto px-4">
+                    <div className="bg-white rounded-lg shadow-md p-4 mb-6">
+                        <h2 className="text-xl font-bold text-center">Conflict Resolution ({currentIndex + 1} / {queue.length})</h2>
+                    </div>
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        {/* Main Panel */}
+                        <div className="lg:col-span-2 bg-white rounded-lg shadow-lg p-6">
+                            <h3 className="text-xl font-bold text-gray-800 mb-2">{reference.title}</h3>
+                            <p className="text-sm text-gray-600 mb-4">{reference.authors} ({reference.year})</p>
+                            <div className="border-t pt-4">
+                                <h4 className="font-semibold mb-2">Abstract</h4>
+                                <p className={`text-gray-700 whitespace-pre-wrap ${!showFullAbstract ? 'line-clamp-6' : ''}`}>{reference.abstract || 'No abstract.'}</p>
+                                {reference.abstract && reference.abstract.length > 500 && (
+                                    <button onClick={() => setShowFullAbstract(!showFullAbstract)} className="text-blue-600 hover:text-blue-800 text-sm mt-2">
+                                        {showFullAbstract ? 'Show less' : 'Show full abstract'}
+                                    </button>
+                                )}
+                            </div>
+                            <div className="mt-6">
+                                <h4 className="font-bold text-lg mb-4 text-center text-orange-600"><i className="fas fa-exclamation-triangle mr-2"></i>AI Reviewer Disagreement</h4>
+                                <div className="space-y-4">
+                                    <ReviewerCard review={reviewer1} />
+                                    <ReviewerCard review={reviewer2} />
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Side Panel */}
+                        <div className="space-y-6">
+                            <div className="bg-white rounded-lg shadow-lg p-6">
+                                <h4 className="font-bold text-xl mb-4 text-center">Your Final Decision</h4>
+                                <textarea value={notes} onChange={(e) => setNotes(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-md mb-4" rows="3" placeholder="Add your reasoning for the final decision..."/>
+                                <div className="flex flex-col gap-3">
+                                    <button onClick={() => handleDecision('include')} className="w-full py-3 bg-green-600 text-white rounded-md font-medium"><i className="fas fa-check mr-2"></i>Include</button>
+                                    <button onClick={() => handleDecision('exclude')} className="w-full py-3 bg-red-600 text-white rounded-md font-medium"><i className="fas fa-times mr-2"></i>Exclude</button>
+                                    <button onClick={() => handleDecision('maybe')} className="w-full py-3 bg-yellow-500 text-white rounded-md font-medium"><i className="fas fa-question mr-2"></i>Maybe</button>
+                                </div>
+                            </div>
+                            <div className="bg-white rounded-lg shadow-lg p-6">
+                                <h4 className="font-semibold mb-3"><i className="fas fa-list-check mr-2"></i>Inclusion Criteria</h4>
+                                <div className="space-y-2 text-sm max-h-48 overflow-y-auto">
+                                    <div><strong>P:</strong> {criteria.population}</div>
+                                    <div><strong>I:</strong> {criteria.intervention}</div>
+                                    {criteria.comparator && <div><strong>C:</strong> {criteria.comparator}</div>}
+                                    <div><strong>O:</strong> {criteria.outcome}</div>
+                                    {criteria.studyDesigns.length > 0 && <div><strong>Study Types:</strong> {criteria.studyDesigns.join(', ')}</div>}
+                                    {Object.entries(criteria.additionalCriteria).map(([key, value])=> <div key={key}><strong>{key}:</strong> {value}</div>)}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function ResultsView({ sessionId, onReset }) {
+            const [results, setResults] = useState([]);
+            const [isLoading, setIsLoading] = useState(true);
+            const [expandedRowId, setExpandedRowId] = useState(null);
+
+            useEffect(() => {
+                const fetchResults = async () => {
+                    if (!sessionId) { setIsLoading(false); return; }
+                    try {
+                        const data = await apiClient.getResults(sessionId);
+                        setResults(data.results);
+                    } catch (error) { console.error("Failed to fetch results:", error); }
+                    finally { setIsLoading(false); }
+                };
+                fetchResults();
+            }, [sessionId]);
+
+            const stats = useMemo(() => {
+                const included = results.filter(r => getFinalDecision(r) === 'include').length;
+                const excluded = results.filter(r => getFinalDecision(r) === 'exclude').length;
+                const maybe = results.filter(r => getFinalDecision(r) === 'maybe').length;
+                return { total: results.length, included, excluded, maybe };
+            }, [results]);
+
+            const DecisionDetails = ({ result }) => {
+                const { reviewer1, reviewer2, human_resolution, status } = result;
+                if (status === 'agreement') {
+                    return <div className="p-4"><p className="font-semibold">Agreement between AI reviewers.</p><p><strong>Reasons:</strong> {(reviewer1.reasons || []).join(', ')}</p></div>;
+                }
+                if (human_resolution) {
+                     return (
+                        <div className="p-4 space-y-4">
+                            <h4 className="font-bold text-lg">Conflict Resolved by Human</h4>
+                            <p><strong>Final Decision:</strong> <span className="font-mono">{human_resolution.decision}</span></p>
+                            <p><strong>Notes:</strong> {human_resolution.notes || 'No notes provided.'}</p>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-2">
+                                <div><p className="font-semibold">Methodologist said: <span className="font-mono">{reviewer1.decision}</span></p><ul className="list-disc list-inside text-sm">{(reviewer1.reasons || []).map((r,i) => <li key={i}>{r}</li>)}</ul></div>
+                                <div><p className="font-semibold">Clinician said: <span className="font-mono">{reviewer2.decision}</span></p><ul className="list-disc list-inside text-sm">{(reviewer2.reasons || []).map((r,i) => <li key={i}>{r}</li>)}</ul></div>
+                            </div>
+                        </div>
+                    );
+                }
+                return <div className="p-4">Details not available.</div>;
+            };
+
+            const getFinalDecision = (result) => result.human_resolution ? result.human_resolution.decision : result.final_decision;
+            const getReference = (result) => result.reference || result.reviewer1 || {};
+
+            if (isLoading) return <div className="text-center p-12"><i className="fas fa-spinner fa-spin text-4xl"></i><p>Loading Final Results...</p></div>;
+
+            return (
+                <div className="max-w-7xl mx-auto px-4">
+                    <div className="bg-white rounded-lg shadow-lg p-8">
+                        <h2 className="text-xl font-bold mb-6 text-gray-800"><i className="fas fa-chart-pie mr-3 text-gray-400"></i>Final Screening Results</h2>
+                        {/* Summary Statistics */}
+                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+                            <div className="bg-blue-50 p-4 rounded-lg text-center"><div className="text-2xl font-bold text-blue-600">{stats.total}</div><div className="text-sm text-gray-600">Total</div></div>
+                            <div className="bg-green-50 p-4 rounded-lg text-center"><div className="text-2xl font-bold text-green-600">{stats.included}</div><div className="text-sm text-gray-600">Included</div></div>
+                            <div className="bg-red-50 p-4 rounded-lg text-center"><div className="text-2xl font-bold text-red-600">{stats.excluded}</div><div className="text-sm text-gray-600">Excluded</div></div>
+                            <div className="bg-yellow-50 p-4 rounded-lg text-center"><div className="text-2xl font-bold text-yellow-600">{stats.maybe}</div><div className="text-sm text-gray-600">Maybe</div></div>
+                        </div>
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full divide-y divide-gray-200">
+                                <thead className="bg-gray-50">
+                                    <tr>
+                                        <th className="w-12"></th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Title</th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Year</th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Final Decision</th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Resolution</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="bg-white divide-y divide-gray-200">
+                                    {results.map((res) => {
+                                        const finalDecision = getFinalDecision(res);
+                                        const ref = getReference(res);
+                                        return (
+                                        <React.Fragment key={ref.id}>
+                                            <tr>
+                                                <td className="px-4 py-4 text-center">
+                                                    <button onClick={() => setExpandedRowId(expandedRowId === ref.id ? null : ref.id)} className="text-gray-500 hover:text-blue-600">
+                                                        <i className={`fas fa-fw ${expandedRowId === ref.id ? 'fa-chevron-down' : 'fa-chevron-right'}`}></i>
+                                                    </button>
+                                                </td>
+                                                <td className="px-6 py-4 text-sm font-medium text-gray-900">{ref.title}</td>
+                                                <td className="px-6 py-4 text-sm text-gray-500">{ref.year || 'N/A'}</td>
+                                                <td className="px-6 py-4">
+                                                    <span className={`px-2 py-1 text-xs rounded-full font-semibold ${finalDecision === 'include' ? 'bg-green-100 text-green-800' : finalDecision === 'exclude' ? 'bg-red-100 text-red-800' : 'bg-yellow-100 text-yellow-800'}`}>{finalDecision}</span>
+                                                </td>
+                                                <td className="px-6 py-4 text-sm">
+                                                    {res.status === 'agreement' ? <span className="text-green-600"><i className="fas fa-check-double mr-1"></i>AI Agreement</span> : <span className="text-blue-600"><i className="fas fa-user-check mr-1"></i>Human Resolved</span>}
+                                                </td>
+                                            </tr>
+                                            {expandedRowId === ref.id && (
+                                                <tr className="details-row"><td colSpan="5"><DecisionDetails result={res} /></td></tr>
+                                            )}
+                                        </React.Fragment>
+                                    )})}
+                                </tbody>
+                            </table>
+                        </div>
+                         <div className="mt-8 flex justify-end">
+                             <button onClick={onReset} className="px-4 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100">
+                                <i className="fas fa-sync-alt mr-2"></i>Start New Review
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<SystematicReviewApp />, document.getElementById('root'));
+    </script>
+</body>
+</html>
